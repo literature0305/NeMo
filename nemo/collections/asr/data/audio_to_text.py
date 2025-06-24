@@ -44,6 +44,7 @@ __all__ = [
     'AudioToBPEDataset',
     'TarredAudioToCharDataset',
     'TarredAudioToBPEDataset',
+    'TextOnlyDataset',
 ]
 
 VALID_FILE_FORMATS = ';'.join(['wav', 'mp3', 'flac', 'opus'] + [fmt.lower() for fmt in valid_sf_formats.keys()])
@@ -1369,6 +1370,170 @@ class BucketingIterator:
         if len(batches) == 0:
             raise StopIteration
         return batches
+
+
+class TextOnlyDataset(Dataset):
+    """
+    Dataset that loads tokenized text data from a JSON file.
+    Each line in the JSON file is expected to be a list of integers (token IDs).
+    Args:
+        tokenized_text_filepath (str): Path to the JSON file containing tokenized text.
+        tokenizer: Tokenizer object, used for pad_id, bos_id, eos_id.
+        bos_id (Optional[int]): BOS token ID. If None, will try to use tokenizer.bos_id.
+        eos_id (Optional[int]): EOS token ID. If None, will try to use tokenizer.eos_id.
+        pad_id (int): Padding token ID. If tokenizer is provided, tokenizer.pad_id will be preferred.
+    """
+
+    @property
+    def output_types(self) -> Optional[Dict[str, NeuralType]]:
+        """Returns definitions of module output ports."""
+        return {
+            'transcripts': NeuralType(('B', 'T'), LabelsType()),
+            'transcript_length': NeuralType(tuple('B'), LengthsType()),
+        }
+
+    def __init__(
+        self,
+        tokenized_text_filepath: str,
+        tokenizer: Optional['nemo.collections.common.tokenizers.TokenizerSpec'] = None,
+        bos_id: Optional[int] = None,
+        eos_id: Optional[int] = None,
+        pad_id: int = 0,
+    ):
+        super().__init__()
+        self.tokenized_text_filepath = tokenized_text_filepath
+
+        self.pad_id = pad_id
+        self.bos_id = bos_id
+        self.eos_id = eos_id
+
+        if tokenizer is not None:
+            if hasattr(tokenizer, "pad_id") and tokenizer.pad_id is not None:
+                self.pad_id = tokenizer.pad_id
+            if hasattr(tokenizer, "bos_id") and tokenizer.bos_id is not None: # Use tokenizer's if available
+                self.bos_id = tokenizer.bos_id
+            if hasattr(tokenizer, "eos_id") and tokenizer.eos_id is not None: # Use tokenizer's if available
+                self.eos_id = tokenizer.eos_id
+
+        self.entries = []
+        if not os.path.exists(self.tokenized_text_filepath):
+            logging.warning(
+                f"Text-only data file not found: {self.tokenized_text_filepath}. "
+                f"Current working directory: {os.getcwd()}"
+            )
+        else:
+            with open(self.tokenized_text_filepath, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f):
+                    line_content = line.strip()
+                    if not line_content:
+                        continue
+                    try:
+                        tokens = json.loads(line_content)
+                        if isinstance(tokens, list) and all(isinstance(t, int) for t in tokens):
+                            self.entries.append(tokens)
+                        else:
+                            logging.warning(
+                                f"Skipping line {line_num + 1} in {self.tokenized_text_filepath} (not a list of ints): {line_content}"
+                            )
+                    except json.JSONDecodeError:
+                        logging.warning(
+                            f"Skipping line {line_num + 1} in {self.tokenized_text_filepath} (JSONDecodeError): {line_content}"
+                        )
+
+        if not self.entries:
+            logging.warning(f"No valid entries loaded from {self.tokenized_text_filepath}. Dataset is empty.")
+
+    def __getitem__(self, index):
+        tokens = self.entries[index]
+
+        processed_tokens = []
+        if self.bos_id is not None:
+            processed_tokens.append(self.bos_id)
+        processed_tokens.extend(tokens)
+        if self.eos_id is not None:
+            processed_tokens.append(self.eos_id)
+
+        tokens_tensor = torch.tensor(processed_tokens).long()
+        tokens_len_tensor = torch.tensor(len(processed_tokens)).long()
+
+        # This dataset only provides text, so audio parts are None.
+        # The collate_fn should handle this.
+        return None, None, tokens_tensor, tokens_len_tensor
+
+    def __len__(self):
+        return len(self.entries)
+
+    # This dataset can use the generic _speech_collate_fn if __getitem__ returns the 4-tuple structure.
+    # Or, a custom collate_fn can be specified in the DataLoader.
+    # For clarity, let's ensure this dataset provides a collate_fn that correctly handles its output.
+    def _collate_fn(self, batch):
+        # batch is a list of (None, None, tokens_tensor, tokens_len_tensor)
+
+        # We only need to collate the text parts.
+        tokens_list = [item[2] for item in batch if item[2] is not None]
+        tokens_lengths_list = [item[3] for item in batch if item[3] is not None]
+
+        if not tokens_list: # If batch was empty or all items were filtered
+            return None, None, None, None
+
+        max_tokens_len = max(l.item() for l in tokens_lengths_list)
+
+        padded_tokens = []
+        for tokens_i, tokens_i_len in zip(tokens_list, tokens_lengths_list):
+            tokens_i_len_item = tokens_i_len.item()
+            if tokens_i_len_item < max_tokens_len:
+                pad_len = max_tokens_len - tokens_i_len_item
+                tokens_i = torch.nn.functional.pad(tokens_i, (0, pad_len), value=self.pad_id)
+            padded_tokens.append(tokens_i)
+
+        tokens = torch.stack(padded_tokens)
+        tokens_lengths = torch.stack(tokens_lengths_list)
+
+        return None, None, tokens, tokens_lengths
+
+
+# Dedicated collate function for TextOnlyDataset if its __getitem__ returned (tokens, tokens_len)
+# However, since __getitem__ is already returning the 4-tuple (None, None, text, text_len),
+# the _collate_fn within TextOnlyDataset or the global _speech_collate_fn can be used.
+# For explicitness, if a dataloader for TextOnlyDataset needs a specific collate_fn:
+def _collate_fn_txt_only(batch, pad_id):
+    """
+    Collate function for text-only batches.
+    Args:
+        batch: A list of tuples, where each tuple is (tokens_tensor, tokens_len_tensor)
+               OR (None, None, tokens_tensor, tokens_len_tensor) from TextOnlyDataset.__getitem__
+        pad_id: ID for padding.
+    Returns:
+        A tuple (None, None, padded_tokens, tokens_lengths).
+    """
+    if not batch:
+        return None, None, None, None
+
+    # Check if batch items are 2-tuples or 4-tuples
+    if len(batch[0]) == 2: # (tokens, tokens_len)
+        tokens_list, tokens_lengths_list = zip(*batch)
+    elif len(batch[0]) == 4: # (None, None, tokens, tokens_len)
+        _, _, tokens_list, tokens_lengths_list = zip(*batch)
+    else:
+        raise ValueError("Batch items have an unexpected structure.")
+
+    if not tokens_list:
+        return None, None, None, None
+
+    max_tokens_len = max(l.item() for l in tokens_lengths_list)
+
+    padded_tokens = []
+    for tokens_i, tokens_i_len in zip(tokens_list, tokens_lengths_list):
+        tokens_i_len_item = tokens_i_len.item()
+        if tokens_i_len_item < max_tokens_len:
+            pad = (0, max_tokens_len - tokens_i_len_item)
+            tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
+        padded_tokens.append(tokens_i)
+
+    tokens = torch.stack(padded_tokens)
+    tokens_lengths = torch.stack(tokens_lengths_list)
+
+    return None, None, tokens, tokens_lengths
 
 
 class RandomizedChainDataset(ChainDataset):

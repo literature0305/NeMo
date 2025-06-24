@@ -32,6 +32,8 @@ from nemo.collections.asr.parts.utils.timestamp_utils import process_timestamp_o
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import AccessMixin
 from nemo.utils import logging, model_utils
+from nemo.collections.asr.data.audio_to_text import TextOnlyDataset, _collate_fn_txt_only # Added
+from math import ceil # Added for setup_training_data
 
 
 class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRTranscriptionMixin):
@@ -90,6 +92,57 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
 
         # setting up interCTC loss (from InterCTCMixin)
         self.setup_interctc(decoder_name='ctc_decoder', loss_name='ctc_loss', wer_name='ctc_wer')
+
+    def _setup_dataloader_from_config(self, config: Optional[Dict]):
+        # Check if this is for the text-only dataset
+        # config might be a DictConfig, convert to dict for .get typically
+        config_dict = OmegaConf.to_container(config, resolve=True) if isinstance(config, DictConfig) else config
+
+        if config_dict.get('is_text_only_dataset', False) or config_dict.get('tokenized_text_filepath', None) is not None:
+
+            dataset = TextOnlyDataset(
+                tokenized_text_filepath=config_dict['tokenized_text_filepath'],
+                tokenizer=getattr(self, 'tokenizer', None),
+                bos_id=config_dict.get('bos_id', None),
+                eos_id=config_dict.get('eos_id', None),
+                pad_id=config_dict.get('pad_id', self.tokenizer.pad_id if hasattr(self, 'tokenizer') and self.tokenizer.pad_id is not None else 0) # Ensure pad_id is correctly sourced
+            )
+
+            collate_fn_to_use = dataset._collate_fn
+
+            return torch.utils.data.DataLoader(
+                dataset=dataset,
+                batch_size=config_dict['batch_size'],
+                collate_fn=collate_fn_to_use,
+                drop_last=config_dict.get('drop_last', False),
+                shuffle=config_dict.get('shuffle', True),
+                num_workers=config_dict.get('num_workers', 0),
+                pin_memory=config_dict.get('pin_memory', False),
+            )
+        else:
+            # Default to parent class's method for audio datasets
+            return super()._setup_dataloader_from_config(config)
+
+    def setup_training_data(self, train_data_config: Optional[Union[DictConfig, Dict]]):
+        if 'shuffle' not in train_data_config:
+            train_data_config['shuffle'] = True
+
+        self._update_dataset_config(dataset_name='train', config=train_data_config)
+        self._train_dl = self._setup_dataloader_from_config(config=train_data_config)
+
+        if self._train_dl is not None and hasattr(self._train_dl, 'dataset') and \
+           isinstance(self._train_dl.dataset, torch.utils.data.IterableDataset) and \
+           not isinstance(self._train_dl.dataset, TextOnlyDataset):
+            if self._trainer is not None and isinstance(self._trainer.limit_train_batches, float):
+                self._trainer.limit_train_batches = int(
+                    self._trainer.limit_train_batches
+                    * ceil((len(self._train_dl.dataset) / self.world_size) / train_data_config['batch_size'])
+                )
+            elif self._trainer is None:
+                logging.warning(
+                    "Model Trainer was not set before constructing the dataset, incorrect number of "
+                    "training batches will be used. Please set the trainer and rebuild the dataset."
+                )
 
     @torch.no_grad()
     def transcribe(
@@ -371,6 +424,147 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         if AccessMixin.is_access_enabled(self.model_guid):
             AccessMixin.reset_registry(self)
 
+        if self.is_interctc_enabled(): # For Hybrid model
+            AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
+
+        signal, signal_len, transcript, transcript_len = batch
+
+        is_text_only_batch = signal is None and signal_len is None
+
+        if hasattr(self, '_trainer') and self._trainer is not None:
+            log_every_n_steps = self._trainer.log_every_n_steps
+            sample_id = self._trainer.global_step
+        else:
+            log_every_n_steps = 1
+            sample_id = batch_nb
+
+        compute_wer = (sample_id + 1) % log_every_n_steps == 0
+
+        tensorboard_logs = {
+            'learning_rate': self._optimizer.param_groups[0]['lr'],
+            'global_step': torch.tensor(self.trainer.global_step, dtype=torch.float32),
+        }
+
+        loss_value = None
+
+        if is_text_only_batch:
+            # Text-only data processing for RNNT decoder training
+            if self.cfg.model_defaults.enc_hidden is None: # Ensure enc_hidden is available
+                raise ValueError("cfg.model_defaults.enc_hidden must be set for text-only RNNT decoder training.")
+
+            dummy_encoded_dim = self.cfg.model_defaults.enc_hidden
+            batch_size = transcript.size(0)
+            device = transcript.device
+
+            # Determine dtype for dummy_encoded. Try to match encoder's output dtype if possible.
+            # Fallback to float32 if specific dtype cannot be determined.
+            # This attempts to get the dtype from the first conv layer of a conformer encoder if it exists
+            # A more robust way might be to check self.encoder.output_types or a similar property
+            encoder_output_dtype = torch.float32 # Default dtype
+            if hasattr(self.encoder, 'conv_subsampling') and hasattr(self.encoder.conv_subsampling, 'conv') and hasattr(self.encoder.conv_subsampling.conv, 'out_channels'):
+                 # Assuming the first conv layer's parameters can give a hint. This is fragile.
+                 # A better approach would be to have a defined output dtype for the encoder.
+                 try:
+                     # Try to get dtype from a parameter of the encoder if available
+                     encoder_output_dtype = next(self.encoder.parameters()).dtype
+                 except StopIteration:
+                     pass # Keep default if no parameters
+
+            dummy_encoded = torch.zeros((batch_size, 1, dummy_encoded_dim), device=device, dtype=encoder_output_dtype)
+            dummy_encoded_len = torch.ones(batch_size, device=device, dtype=torch.long)
+
+            decoder_output, _, _ = self.decoder(targets=transcript, target_length=transcript_len)
+
+            if not self.joint.fuse_loss_wer:
+                joint_output = self.joint(encoder_outputs=dummy_encoded, decoder_outputs=decoder_output)
+                loss_value = self.loss(
+                    log_probs=joint_output,
+                    targets=transcript,
+                    input_lengths=dummy_encoded_len,
+                    target_lengths=transcript_len
+                )
+            else:
+                loss_value, wer, _, _ = self.joint(
+                    encoder_outputs=dummy_encoded,
+                    decoder_outputs=decoder_output,
+                    encoder_lengths=dummy_encoded_len,
+                    transcripts=transcript,
+                    transcript_lengths=transcript_len,
+                    compute_wer=compute_wer
+                )
+                if compute_wer:
+                    tensorboard_logs.update({'training_batch_wer_txt_only': wer})
+
+            tensorboard_logs['train_rnnt_loss_txt_only'] = loss_value
+            # No CTC or InterCTC for text-only
+
+        else: # This is an audio batch
+            if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+                encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
+            else:
+                encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
+            del signal
+
+            decoder_output, target_length_for_loss, _ = self.decoder(targets=transcript, target_length=transcript_len)
+
+            if not self.joint.fuse_loss_wer:
+                joint_output = self.joint(encoder_outputs=encoded, decoder_outputs=decoder_output)
+                loss_value = self.loss(
+                    log_probs=joint_output, targets=transcript, input_lengths=encoded_len, target_lengths=target_length_for_loss
+                )
+                loss_value = self.add_auxiliary_losses(loss_value)
+                if compute_wer:
+                    self.wer.update(
+                        predictions=encoded,
+                        predictions_lengths=encoded_len,
+                        targets=transcript,
+                        targets_lengths=transcript_len,
+                    )
+                    _, scores, words = self.wer.compute()
+                    self.wer.reset()
+                    tensorboard_logs.update({'training_batch_wer': scores.float() / words})
+            else:
+                loss_value, wer, _, _ = self.joint(
+                    encoder_outputs=encoded,
+                    decoder_outputs=decoder_output,
+                    encoder_lengths=encoded_len,
+                    transcripts=transcript,
+                    transcript_lengths=transcript_len,
+                    compute_wer=compute_wer,
+                )
+                loss_value = self.add_auxiliary_losses(loss_value)
+                if compute_wer:
+                    tensorboard_logs.update({'training_batch_wer': wer})
+
+            if self.ctc_loss_weight > 0:
+                log_probs_ctc = self.ctc_decoder(encoder_output=encoded)
+                ctc_loss_val = self.ctc_loss( # renamed to avoid conflict with self.ctc_loss if it's a module
+                    log_probs=log_probs_ctc, targets=transcript, input_lengths=encoded_len, target_lengths=transcript_len
+                )
+                tensorboard_logs['train_rnnt_loss'] = loss_value
+                tensorboard_logs['train_ctc_loss'] = ctc_loss_val
+                loss_value = (1 - self.ctc_loss_weight) * loss_value + self.ctc_loss_weight * ctc_loss_val
+                if compute_wer:
+                    self.ctc_wer.update(
+                        predictions=log_probs_ctc,
+                        targets=transcript,
+                        targets_lengths=transcript_len,
+                        predictions_lengths=encoded_len,
+                    )
+                    ctc_wer_val, _, _ = self.ctc_wer.compute()
+                    self.ctc_wer.reset()
+                    tensorboard_logs.update({'training_batch_wer_ctc': ctc_wer_val})
+
+            loss_value, additional_logs = self.add_interctc_losses(
+                loss_value, transcript, transcript_len, compute_wer=compute_wer
+            )
+            tensorboard_logs.update(additional_logs)
+
+        tensorboard_logs['train_loss'] = loss_value
+
+        if AccessMixin.is_access_enabled(self.model_guid):
+            AccessMixin.reset_registry(self)
+
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
 
@@ -484,12 +678,15 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         self.log_dict(tensorboard_logs)
 
         # Preserve batch acoustic model T and language model U parameters if normalizing
-        if self._optim_normalize_joint_txu:
-            self._optim_normalize_txu = [encoded_len.max(), transcript_len.max()]
+        if not is_text_only_batch and self._optim_normalize_joint_txu: # Only for audio batches
+             if encoded_len is not None and transcript_len is not None: # Ensure they exist for audio batches
+                self._optim_normalize_txu = [encoded_len.max(), transcript_len.max()]
 
         return {'loss': loss_value}
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
+        # Assuming predict_step is primarily for audio data.
+        # If text-only data needs prediction, this might need adjustment.
         signal, signal_len, transcript, transcript_len, sample_id = batch
 
         # forward() only performs encoder forward
