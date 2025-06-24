@@ -374,10 +374,60 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRT
         if self.is_interctc_enabled():
             AccessMixin.set_access_enabled(access_enabled=True, guid=self.model_guid)
 
-        signal, signal_len, transcript, transcript_len = batch
+        # Check if text-only data is present in the batch
+        if len(batch) == 6:
+            signal, signal_len, transcript, transcript_len, txt, txt_len = batch
+            print('txt:', txt) # Print the text-only data as requested
+            # Placeholder for text-only data usage in loss, if applicable
+            # For now, txt and txt_len are unpacked but not used further in loss calculation with audio.
+        elif len(batch) == 4:
+            signal, signal_len, transcript, transcript_len = batch
+            txt, txt_len = None, None # Explicitly set to None if not present
+        else:
+            # Log an error or raise an exception if the batch structure is unexpected.
+            # This helps in debugging data pipeline issues.
+            logging.error(f"Unexpected batch size in training_step. Expected 4 or 6 elements, got {len(batch)}")
+            # Depending on strictness, you might want to raise ValueError here.
+            # For now, we'll try to proceed assuming the essential audio data is in the first 4 elements if len(batch) > 4.
+            # This might not be robust.
+            if len(batch) > 4:
+                 signal, signal_len, transcript, transcript_len = batch[0], batch[1], batch[2], batch[3]
+                 txt, txt_len = None, None
+            else: # len(batch) < 4, which is definitely an error.
+                raise ValueError(f"Batch too small. Expected 4 or 6 elements, got {len(batch)}")
+
 
         # forward() only performs encoder forward
+        # Ensure that 'signal' and 'signal_len' are correctly assigned before this block.
+        # The DALIOutputs check should ideally be on the 'signal' part of the batch if it's specific to audio.
+        # However, 'batch' itself is passed to DALIOutputs check in original code.
+        # For safety, we'll assume the check is on the whole batch object.
+        # If DALIOutputs implies a structure that conflicts with len(batch) == 6, this needs refinement.
+
         if isinstance(batch, DALIOutputs) and batch.has_processed_signal:
+            # This block expects 'signal' and 'signal_len' to be the first two elements if DALI processed signal is used.
+            # If len(batch) was 6, signal and signal_len are already unpacked.
+            # If DALIOutputs wraps the entire 6-element batch, this is fine.
+            # If DALIOutputs only ever wraps 2 or 4 elements, then the batch unpacking logic needs to be aware of DALI.
+            # Assuming DALIOutputs means signal and signal_len are the relevant parts it modified or provides.
+            processed_signal_to_use = signal if signal is not None else batch[0] # Fallback if signal was not from 6-item unpack
+            processed_signal_length_to_use = signal_len if signal_len is not None else batch[1] # Fallback
+            encoded, encoded_len = self.forward(processed_signal=processed_signal_to_use, processed_signal_length=processed_signal_length_to_use)
+        else:
+            # This block expects 'signal' and 'signal_len' for audio.
+            input_signal_to_use = signal if signal is not None else batch[0] # Fallback
+            input_signal_length_to_use = signal_len if signal_len is not None else batch[1] # Fallback
+            encoded, encoded_len = self.forward(input_signal=input_signal_to_use, input_signal_length=input_signal_length_to_use)
+
+        if signal is not None: # Avoid deleting if it was a fallback from batch[0]
+            del signal
+        # Note: transcript and transcript_len must always be present for loss calculation against audio.
+
+        # During training, loss must be computed, so decoder forward is necessary
+        # This uses 'transcript' and 'transcript_len' from the audio part of the batch.
+        decoder, target_length, states = self.decoder(targets=transcript, target_length=transcript_len)
+
+        if hasattr(self, '_trainer') and self._trainer is not None:
             encoded, encoded_len = self.forward(processed_signal=signal, processed_signal_length=signal_len)
         else:
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)

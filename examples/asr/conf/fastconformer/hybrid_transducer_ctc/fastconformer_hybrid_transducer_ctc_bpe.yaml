@@ -36,7 +36,16 @@ model:
     # bucketing params
     bucketing_strategy: "synced_randomized"
     bucketing_batch_size: null
-
+  train_txt_ds:
+    manifest_filepath: ??? # This will not be used, but needs to be present
+    sample_rate: ${model.sample_rate} # This will not be used, but needs to be present
+    batch_size: 64
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    use_start_end_token: ${model.tokenizer.use_start_end_token}
+    trim_silence: false # This will not be used, but needs to be present
+    tokenized_text_filepath: librispeech_tokenized_corpus.json # Path to the tokenized text corpus
   validation_ds:
     manifest_filepath: ???
     sample_rate: ${model.sample_rate}

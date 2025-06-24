@@ -57,57 +57,114 @@ def _speech_collate_fn(batch, pad_id):
                encoded tokens, and encoded tokens length.  This collate func
                assumes the signals are 1d torch tensors (i.e. mono audio).
     """
+    # Determine the structure of the batch items by checking the length of the first item
+    # This assumes all items in the batch have the same structure
+    first_item_len = len(batch[0])
+    has_sample_ids = False
+    has_unpaired_text = False
+
+    if first_item_len == 4: # audio, audio_len, tokens, token_len
+        pass
+    elif first_item_len == 5: # audio, audio_len, tokens, token_len, sample_id
+        has_sample_ids = True
+    elif first_item_len == 6: # audio, audio_len, tokens, token_len, unpaired_tokens, unpaired_token_len
+        has_unpaired_text = True
+    elif first_item_len == 7: # audio, audio_len, tokens, token_len, unpaired_tokens, unpaired_token_len, sample_id
+        has_sample_ids = True
+        has_unpaired_text = True
+    else:
+        raise ValueError(f"Expects 4, 5, 6, or 7 elements in each batch item, got {first_item_len}")
+
     packed_batch = list(zip(*batch))
-    if len(packed_batch) == 5:
-        _, audio_lengths, _, tokens_lengths, sample_ids = packed_batch
-    elif len(packed_batch) == 4:
-        sample_ids = None
-        _, audio_lengths, _, tokens_lengths = packed_batch
-    else:
-        raise ValueError("Expects 4 or 5 tensors in the batch!")
-    max_audio_len = 0
-    has_audio = audio_lengths[0] is not None
-    if has_audio:
-        max_audio_len = max(audio_lengths).item()
-    has_tokens = tokens_lengths[0] is not None
-    if has_tokens:
-        max_tokens_len = max(tokens_lengths).item()
 
-    audio_signal, tokens = [], []
-    for b in batch:
-        if len(b) == 5:
-            sig, sig_len, tokens_i, tokens_i_len, _ = b
+    audio_signals_raw = packed_batch[0]
+    audio_lengths_raw = packed_batch[1]
+    tokens_raw = packed_batch[2]
+    tokens_lengths_raw = packed_batch[3]
+
+    unpaired_tokens_raw = None
+    unpaired_tokens_lengths_raw = None
+    if has_unpaired_text:
+        unpaired_tokens_raw = packed_batch[4]
+        unpaired_tokens_lengths_raw = packed_batch[5]
+
+    sample_ids_raw = None
+    if has_sample_ids:
+        if has_unpaired_text:
+            sample_ids_raw = packed_batch[6]
         else:
-            sig, sig_len, tokens_i, tokens_i_len = b
-        if has_audio:
-            sig_len = sig_len.item()
-            if sig_len < max_audio_len:
-                pad = (0, max_audio_len - sig_len)
-                sig = torch.nn.functional.pad(sig, pad)
-            audio_signal.append(sig)
-        if has_tokens:
-            tokens_i_len = tokens_i_len.item()
-            if tokens_i_len < max_tokens_len:
-                pad = (0, max_tokens_len - tokens_i_len)
-                tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
-            tokens.append(tokens_i)
+            sample_ids_raw = packed_batch[4]
 
+    max_audio_len = 0
+    has_audio = audio_lengths_raw[0] is not None
     if has_audio:
-        audio_signal = torch.stack(audio_signal)
-        audio_lengths = torch.stack(audio_lengths)
-    else:
-        audio_signal, audio_lengths = None, None
+        max_audio_len = max(audio_lengths_raw).item()
+
+    max_tokens_len = 0
+    has_tokens = tokens_lengths_raw[0] is not None
     if has_tokens:
-        tokens = torch.stack(tokens)
-        tokens_lengths = torch.stack(tokens_lengths)
+        max_tokens_len = max(tokens_lengths_raw).item()
+
+    max_unpaired_tokens_len = 0
+    has_unpaired = unpaired_tokens_lengths_raw[0] is not None if has_unpaired_text else False
+    if has_unpaired:
+        max_unpaired_tokens_len = max(unpaired_tokens_lengths_raw).item()
+
+
+    audio_signal_padded, tokens_padded, unpaired_tokens_padded = [], [], []
+
+    for i in range(len(batch)):
+        sig = audio_signals_raw[i]
+        sig_len = audio_lengths_raw[i]
+        tokens_i = tokens_raw[i]
+        tokens_i_len = tokens_lengths_raw[i]
+
+        if has_audio:
+            current_sig_len = sig_len.item()
+            if current_sig_len < max_audio_len:
+                pad = (0, max_audio_len - current_sig_len)
+                sig = torch.nn.functional.pad(sig, pad)
+            audio_signal_padded.append(sig)
+
+        if has_tokens:
+            current_tokens_i_len = tokens_i_len.item()
+            if current_tokens_i_len < max_tokens_len:
+                pad = (0, max_tokens_len - current_tokens_i_len)
+                tokens_i = torch.nn.functional.pad(tokens_i, pad, value=pad_id)
+            tokens_padded.append(tokens_i)
+
+        if has_unpaired:
+            unpaired_tokens_i = unpaired_tokens_raw[i]
+            unpaired_tokens_i_len = unpaired_tokens_lengths_raw[i]
+            current_unpaired_tokens_i_len = unpaired_tokens_i_len.item()
+            if current_unpaired_tokens_i_len < max_unpaired_tokens_len:
+                pad = (0, max_unpaired_tokens_len - current_unpaired_tokens_i_len)
+                unpaired_tokens_i = torch.nn.functional.pad(unpaired_tokens_i, pad, value=pad_id)
+            unpaired_tokens_padded.append(unpaired_tokens_i)
+
+
+    # Stack padded tensors
+    final_audio_signal = torch.stack(audio_signal_padded) if has_audio else None
+    final_audio_lengths = torch.stack(list(audio_lengths_raw)) if has_audio else None # Convert tuple to list before stacking for some torch versions
+    final_tokens = torch.stack(tokens_padded) if has_tokens else None
+    final_tokens_lengths = torch.stack(list(tokens_lengths_raw)) if has_tokens else None
+
+    final_unpaired_tokens = torch.stack(unpaired_tokens_padded) if has_unpaired else None
+    final_unpaired_tokens_lengths = torch.stack(list(unpaired_tokens_lengths_raw)) if has_unpaired else None
+
+    final_sample_ids = torch.tensor(sample_ids_raw, dtype=torch.int32) if has_sample_ids else None
+
+    # Construct the return tuple based on what's available
+    if has_unpaired_text:
+        if has_sample_ids:
+            return final_audio_signal, final_audio_lengths, final_tokens, final_tokens_lengths, final_unpaired_tokens, final_unpaired_tokens_lengths, final_sample_ids
+        else:
+            return final_audio_signal, final_audio_lengths, final_tokens, final_tokens_lengths, final_unpaired_tokens, final_unpaired_tokens_lengths
     else:
-        tokens = None
-        tokens_lengths = None
-    if sample_ids is None:
-        return audio_signal, audio_lengths, tokens, tokens_lengths
-    else:
-        sample_ids = torch.tensor(sample_ids, dtype=torch.int32)
-        return audio_signal, audio_lengths, tokens, tokens_lengths, sample_ids
+        if has_sample_ids:
+            return final_audio_signal, final_audio_lengths, final_tokens, final_tokens_lengths, final_sample_ids
+        else:
+            return final_audio_signal, final_audio_lengths, final_tokens, final_tokens_lengths
 
 
 class ASRManifestProcessor:
