@@ -136,27 +136,14 @@ class AudioText(_Collection):
         """
 
         output_type = self.OUTPUT_TYPE
-        all_has_duration = True
-        data, duration_filtered, num_filtered, total_duration = [], 0.0, 0, 0.0
+
+        data_unfiltered = []
         if index_by_file_id:
             self.mapping = {}
 
         for id_, audio_file, duration, offset, text, speaker, orig_sr, token_labels, lang in zip(
             ids, audio_files, durations, offsets, texts, speakers, orig_sampling_rates, token_labels, langs
         ):
-            if duration is None:
-                all_has_duration = False
-            # Duration filters.
-            if duration is not None and min_duration is not None and duration < min_duration:
-                duration_filtered += duration
-                num_filtered += 1
-                continue
-
-            if duration is not None and max_duration is not None and duration > max_duration:
-                duration_filtered += duration
-                num_filtered += 1
-                continue
-
             if token_labels is not None:
                 text_tokens = token_labels
             else:
@@ -164,9 +151,6 @@ class AudioText(_Collection):
                     if hasattr(parser, "is_aggregate") and parser.is_aggregate and isinstance(text, str):
                         if lang is not None:
                             text_tokens = parser(text, lang)
-                        # for future use if want to add language bypass to audio_to_text classes
-                        # elif hasattr(parser, "lang") and parser.lang is not None:
-                        #    text_tokens = parser(text, parser.lang)
                         else:
                             raise ValueError("lang required in manifest when using aggregate tokenizers")
                     else:
@@ -175,25 +159,57 @@ class AudioText(_Collection):
                     text_tokens = []
 
                 if text_tokens is None:
-                    duration_filtered += duration
-                    num_filtered += 1
                     continue
+
+            data_unfiltered.append(output_type(id_, audio_file, duration, text_tokens, offset, text, speaker, orig_sr, lang))
+
+        self.data_unfiltered = data_unfiltered
+        self.do_sort_by_duration = do_sort_by_duration
+        self.index_by_file_id = index_by_file_id
+        self.max_number = max_number
+        self.min_duration = min_duration
+        self.max_duration = max_duration
+
+        self._filter_by_duration()
+
+    def _filter_by_duration(self):
+        all_has_duration = True
+        data, duration_filtered, num_filtered, total_duration = [], 0.0, 0, 0.0
+
+        # Reset mapping if it exists
+        if self.index_by_file_id:
+            self.mapping = {}
+
+        for item in self.data_unfiltered:
+            duration = item.duration
+            if duration is None:
+                all_has_duration = False
+            # Duration filters.
+            if self.min_duration is not None and duration < self.min_duration:
+                duration_filtered += duration
+                num_filtered += 1
+                continue
+
+            if self.max_duration is not None and duration > self.max_duration:
+                duration_filtered += duration
+                num_filtered += 1
+                continue
 
             total_duration += duration if duration is not None else 0.0
 
-            data.append(output_type(id_, audio_file, duration, text_tokens, offset, text, speaker, orig_sr, lang))
-            if index_by_file_id:
-                file_id, _ = os.path.splitext(os.path.basename(audio_file))
+            data.append(item)
+            if self.index_by_file_id:
+                file_id, _ = os.path.splitext(os.path.basename(item.audio_file))
                 if file_id not in self.mapping:
                     self.mapping[file_id] = []
                 self.mapping[file_id].append(len(data) - 1)
 
             # Max number of entities filter.
-            if len(data) == max_number:
+            if self.max_number and len(data) == self.max_number:
                 break
 
-        if do_sort_by_duration:
-            if index_by_file_id:
+        if self.do_sort_by_duration:
+            if self.index_by_file_id:
                 logging.warning("Tried to sort dataset by duration, but cannot since index_by_file_id is set.")
             else:
                 data.sort(key=lambda entity: entity.duration)
@@ -202,7 +218,12 @@ class AudioText(_Collection):
         logging.info("%d files were filtered totalling %.2f hours", num_filtered, duration_filtered / 3600)
         if not all_has_duration:
             logging.info(f"Not all audios have duration information, the total number of hours is inaccurate.")
-        super().__init__(data)
+
+        self.data = data
+
+    def set_max_duration(self, max_duration):
+        self.max_duration = max_duration
+        self._filter_by_duration()
 
 
 class VideoText(_Collection):

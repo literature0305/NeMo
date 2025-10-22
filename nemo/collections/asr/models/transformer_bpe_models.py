@@ -173,32 +173,42 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
         self.val_loss = GlobalAverageLossMetric(dist_sync_on_step=False, take_avg_loss=True)
         if hasattr(self.cfg, 'curriculum_learning') and self.cfg.curriculum_learning.enabled:
             self.curriculum_learning_config = self.cfg.curriculum_learning
+            self.original_max_duration = self.cfg.train_ds.get('max_duration')
 
-    def on_train_epoch_start(self):
+    def on_train_batch_start(self, batch, batch_idx):
         if hasattr(self, 'curriculum_learning_config'):
-            current_epoch = self.current_epoch
-            max_epochs = self.trainer.max_epochs
+            global_step = self.trainer.global_step
+            max_steps = self.curriculum_learning_config.get('steps')
+
+            if max_steps is None:
+                raise ValueError("`curriculum_learning.steps` must be provided when using step-based curriculum learning.")
 
             start_max_duration = self.curriculum_learning_config.start_max_duration
             end_max_duration = self.curriculum_learning_config.end_max_duration
 
-            # Ensure max_duration does not exceed the dataset's original max_duration
-            original_max_duration = self.cfg.train_ds.get('max_duration')
-            if original_max_duration:
-                end_max_duration = min(end_max_duration, original_max_duration)
+            if self.original_max_duration:
+                end_max_duration = min(end_max_duration, self.original_max_duration)
 
-            # Linear increase of max_duration
-            progress = min(1.0, current_epoch / max_epochs)
-            new_max_duration = start_max_duration + progress * (end_max_duration - start_max_duration)
+            if global_step < max_steps:
+                progress = min(1.0, global_step / max_steps)
+                new_max_duration = start_max_duration + progress * (end_max_duration - start_max_duration)
+            else:
+                new_max_duration = end_max_duration
 
-            # Update dataset config and reload dataloader
-            train_ds_config = self.cfg.train_ds
-            if train_ds_config.get('max_duration') != new_max_duration:
-                logging.info(f"Epoch {current_epoch}: Updating max_duration to {new_max_duration}")
-                with open_dict(train_ds_config):
-                    train_ds_config.max_duration = new_max_duration
-                self.setup_training_data(train_ds_config)
-                self.trainer.reset_train_dataloader()
+            dataset = self._train_dl.dataset
+            if hasattr(dataset, 'manifest_processor') and hasattr(dataset.manifest_processor.collection, 'set_max_duration'):
+                current_max_duration = dataset.manifest_processor.collection.max_duration
+                if current_max_duration != new_max_duration:
+                    dataset.manifest_processor.collection.set_max_duration(new_max_duration)
+                    logging.info(f"Step {global_step}: Updated max_duration to {new_max_duration}")
+            elif hasattr(dataset, 'datasets'): # Handle ConcatDataset
+                for subset in dataset.datasets:
+                    if hasattr(subset, 'manifest_processor') and hasattr(subset.manifest_processor.collection, 'set_max_duration'):
+                        current_max_duration = subset.manifest_processor.collection.max_duration
+                        if current_max_duration != new_max_duration:
+                            subset.manifest_processor.collection.set_max_duration(new_max_duration)
+                if global_step % 200 == 0: # Log every 200 steps to avoid spamming
+                    logging.info(f"Step {global_step}: Updated max_duration to {new_max_duration}")
 
     @torch.no_grad()
     def transcribe(
