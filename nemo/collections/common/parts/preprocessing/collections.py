@@ -483,6 +483,14 @@ class ASRAudioText(AudioText):
         super().__init__(
             ids, audio_files, durations, texts, offsets, speakers, orig_srs, token_labels, langs, *args, **kwargs
         )
+        self.data_backup = self.data
+
+    def set_max_duration(self, max_duration):
+        """
+        Set max_duration and filter samples. This is for curriculum learning.
+        """
+        self.data = [sample for sample in self.data_backup if sample.duration <= max_duration]
+        logging.info(f"filter up to max_duration={max_duration} and got {len(self.data)} samples")
 
 
 class SpeechLLMAudioTextEntity(object):

@@ -470,6 +470,9 @@ class _AudioTextDataset(Dataset):
     def get_manifest_sample(self, sample_id):
         return self.manifest_processor.collection[sample_id]
 
+    def set_max_duration(self, max_duration):
+        self.manifest_processor.collection.set_max_duration(max_duration=max_duration)
+
     def __getitem__(self, index):
         if isinstance(index, IterableABC):
             return [self._process_sample(_index) for _index in index]
