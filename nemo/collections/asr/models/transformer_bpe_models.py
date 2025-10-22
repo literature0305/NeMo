@@ -272,6 +272,10 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
 
         # create audio-only data loader
         self._update_dataset_config(dataset_name='train', config=train_data_config)
+        if train_data_config is not None and 'max_duration' in train_data_config:
+            self._init_max_duration = train_data_config.max_duration
+        else:
+            self._init_max_duration = None
         self._train_dl = self._setup_dataloader_from_config(config=train_data_config)
 
         # Need to set this because if using an IterableDataset, the length of the
@@ -439,6 +443,31 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
         transf_loss = self.transf_loss(log_probs=transf_log_probs, labels=labels)
 
         return transf_loss
+
+    def _set_new_duration(self, dataset, new_duration):
+        if hasattr(dataset, 'set_max_duration'):
+            dataset.set_max_duration(new_duration)
+        elif hasattr(dataset, 'dataset'):
+            self._set_new_duration(dataset.dataset, new_duration)
+        elif hasattr(dataset, 'datasets'):
+            for ds in dataset.datasets:
+                self._set_new_duration(ds, new_duration)
+
+    def on_train_batch_start(self, batch, batch_idx):
+        if (
+            hasattr(self.cfg, 'curriculum_end_step')
+            and self.cfg.curriculum_end_step is not None
+            and self._init_max_duration is not None
+        ):
+            if self.global_step < self.cfg.curriculum_end_step:
+                new_duration = (
+                    self._init_max_duration * 0.05
+                    + (self._init_max_duration - self._init_max_duration * 0.05)
+                    * self.global_step
+                    / self.cfg.curriculum_end_step
+                )
+                self._set_new_duration(self._train_dl.dataset, new_duration)
+                self.log('train_max_duration', new_duration, prog_bar=True)
 
     # PTL-specific methods
     def training_step(self, batch, batch_nb):
