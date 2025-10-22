@@ -171,6 +171,34 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
             self.spec_augmentation = None
 
         self.val_loss = GlobalAverageLossMetric(dist_sync_on_step=False, take_avg_loss=True)
+        if hasattr(self.cfg, 'curriculum_learning') and self.cfg.curriculum_learning.enabled:
+            self.curriculum_learning_config = self.cfg.curriculum_learning
+
+    def on_train_epoch_start(self):
+        if hasattr(self, 'curriculum_learning_config'):
+            current_epoch = self.current_epoch
+            max_epochs = self.trainer.max_epochs
+
+            start_max_duration = self.curriculum_learning_config.start_max_duration
+            end_max_duration = self.curriculum_learning_config.end_max_duration
+
+            # Ensure max_duration does not exceed the dataset's original max_duration
+            original_max_duration = self.cfg.train_ds.get('max_duration')
+            if original_max_duration:
+                end_max_duration = min(end_max_duration, original_max_duration)
+
+            # Linear increase of max_duration
+            progress = min(1.0, current_epoch / max_epochs)
+            new_max_duration = start_max_duration + progress * (end_max_duration - start_max_duration)
+
+            # Update dataset config and reload dataloader
+            train_ds_config = self.cfg.train_ds
+            if train_ds_config.get('max_duration') != new_max_duration:
+                logging.info(f"Epoch {current_epoch}: Updating max_duration to {new_max_duration}")
+                with open_dict(train_ds_config):
+                    train_ds_config.max_duration = new_max_duration
+                self.setup_training_data(train_ds_config)
+                self.trainer.reset_train_dataloader()
 
     @torch.no_grad()
     def transcribe(
